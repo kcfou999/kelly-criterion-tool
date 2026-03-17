@@ -141,6 +141,236 @@ def fetch_rfr_fred() -> float | None:
 # ---------------------------------------------------------------------------
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# 價值指標計算模組（7 大估值指標體系）
+# ──────────────────────────────────────────────────────────────────────────
+
+# 各資產的歷史基準值（low=低估邊界, fair=歷史中位, high=高估邊界）
+INDICATOR_BENCHMARKS: dict[str, dict] = {
+    "pe": {
+        "^TWII": {"low": 10.0, "fair": 15.0, "high": 22.0},
+        "VOO":   {"low": 14.0, "fair": 18.5, "high": 26.0},
+        "QQQ":   {"low": 20.0, "fair": 30.0, "high": 42.0},
+    },
+    "pb": {
+        "VOO":   {"low": 2.0,  "fair": 2.9,  "high": 4.5},
+        "QQQ":   {"low": 4.0,  "fair": 6.0,  "high": 9.0},
+        "^TWII": {"low": 1.0,  "fair": 1.5,  "high": 2.5},
+    },
+    "dividend_yield": {
+        # 值為年化殖利率（如 0.015 = 1.5%），高殖利率 = 低估
+        "VOO":   {"high": 0.020, "fair": 0.015, "low": 0.010},
+        "QQQ":   {"high": 0.008, "fair": 0.005, "low": 0.003},
+        "^TWII": {"high": 0.040, "fair": 0.028, "low": 0.018},
+    },
+}
+
+
+def _sigmoid_score(ratio: float) -> float:
+    """
+    將「當前/基準」比值轉換為 0-100 分（sigmoid 非線性壓縮）。
+    ratio=1.0 → 50；ratio=2.0 → ~95；ratio=0.5 → ~5
+    """
+    import math
+    return 100.0 / (1.0 + math.exp(-3.0 * (ratio - 1.0)))
+
+
+def compute_indicator_scores(
+    indicators: dict[str, float | None],
+    ticker: str,
+    manual_pe: float | None = None,
+) -> dict[str, float | None]:
+    """
+    將原始市場指標值轉換為 0-100 估值評分。
+    高分 = 高估（建議減槓桿）；低分 = 低估（建議加槓桿）。
+
+    Args:
+        indicators: fetch_market_indicators() 的輸出
+        ticker: 資產代號（用於查找歷史基準值）
+        manual_pe: 用戶手動輸入的 P/E（台股無法自動取得時使用）
+
+    Returns:
+        dict: 各指標的 0-100 評分，無法計算則為 None
+    """
+    bm = INDICATOR_BENCHMARKS
+    scores: dict[str, float | None] = {}
+
+    # ── P/E 評分（低 PE = 低估 = 低分）──
+    pe = manual_pe if manual_pe is not None else indicators.get("pe_ratio")
+    if pe and pe > 0:
+        fair_pe = bm["pe"].get(ticker, bm["pe"]["VOO"])["fair"]
+        scores["pe_score"] = _sigmoid_score(pe / fair_pe)
+    else:
+        scores["pe_score"] = None
+
+    # ── P/B 評分（低 P/B = 低估 = 低分）──
+    pb = indicators.get("pb_ratio")
+    if pb and pb > 0:
+        fair_pb = bm["pb"].get(ticker, bm["pb"]["VOO"])["fair"]
+        scores["pb_score"] = _sigmoid_score(pb / fair_pb)
+    else:
+        scores["pb_score"] = None
+
+    # ── 股息殖利率評分（高 Yield = 低估 = 低分，需反轉）──
+    div_yield = indicators.get("dividend_yield")
+    if div_yield and div_yield > 0:
+        fair_yield = bm["dividend_yield"].get(ticker, bm["dividend_yield"]["VOO"])["fair"]
+        scores["dividend_score"] = 100.0 - _sigmoid_score(div_yield / fair_yield)
+    else:
+        scores["dividend_score"] = None
+
+    # ── VIX 評分（高 VIX = 恐慌 = 低估 = 低分，需反轉）──
+    vix = indicators.get("vix")
+    if vix and vix > 0:
+        # VIX=15 → 100分（平靜高估）；VIX=50 → 0分（恐慌低估）
+        scores["vix_score"] = max(0.0, min(100.0, 100.0 - (vix - 15.0) / 35.0 * 100.0))
+    else:
+        scores["vix_score"] = None
+
+    # ── 殖利率曲線評分（倒掛 = 衰退 = 高分；陡峭 = 成長 = 低分）──
+    spread = indicators.get("yield_spread_10y3m")
+    if spread is not None:
+        # spread=2.0 → ~20分（陡峭）；spread=0 → 50分；spread=-1 → ~65分（倒掛）
+        scores["yield_curve_score"] = max(0.0, min(100.0, 50.0 - spread / 2.0 * 30.0))
+    else:
+        scores["yield_curve_score"] = None
+
+    # ── ERP 評分（高 ERP = 低估 = 低分，需反轉）──
+    erp = indicators.get("erp_pct")
+    if erp is not None:
+        # ERP=7% → 0分（低估）；ERP=3% → 100分（高估）；ERP=5.5% → 50分
+        scores["erp_score"] = max(0.0, min(100.0, 100.0 - (erp - 3.0) / 4.0 * 100.0))
+    else:
+        scores["erp_score"] = None
+
+    return scores
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_market_indicators(ticker: str, r_free: float = 0.04) -> dict[str, float | None]:
+    """
+    統一從 yfinance 抓取 6 個估值指標。
+    ^TWII 缺少 P/B、Dividend Yield 時自動降級（返回 None）。
+    ERP 使用 sidebar 傳入的 r_free，確保與 Kelly 計算一致。
+
+    Args:
+        ticker: 資產代號（"^TWII"、"VOO"、"QQQ"）
+        r_free: 無風險利率（小數，如 0.04 = 4%），與 sidebar 同步
+
+    Returns:
+        dict with keys: pe_ratio, pb_ratio, dividend_yield,
+                        vix, yield_spread_10y3m, erp_pct
+        各指標若無法取得則為 None
+    """
+    result: dict[str, float | None] = {
+        "pe_ratio": None,
+        "pb_ratio": None,
+        "dividend_yield": None,
+        "vix": None,
+        "yield_spread_10y3m": None,
+        "erp_pct": None,
+    }
+    try:
+        # ── 資產本身的基本面指標 ──
+        info = yf.Ticker(ticker).info
+        result["pe_ratio"] = info.get("trailingPE")
+        result["pb_ratio"] = info.get("priceToBook")
+        result["dividend_yield"] = info.get("trailingAnnualDividendYield")
+
+        # ── VIX 恐慌指數（全球通用） ──
+        vix_info = yf.Ticker("^VIX").fast_info
+        result["vix"] = vix_info.get("lastPrice") or vix_info.get("regularMarketPrice")
+
+        # ── 殖利率曲線（10Y - 3M） ──
+        tnx = yf.Ticker("^TNX").fast_info.get("lastPrice")   # 10 年美債（單位：%）
+        irx = yf.Ticker("^IRX").fast_info.get("lastPrice")   # 3 個月美債（單位：%）
+        if tnx and irx:
+            result["yield_spread_10y3m"] = float(tnx) - float(irx)
+
+        # ── ERP：預期股票報酬 - 無風險利率（與 sidebar r_free 動態聯動）──
+        result["erp_pct"] = (0.10 - r_free) * 100.0  # 單位：百分點
+
+    except Exception:
+        pass  # 部分失敗不阻斷主流程，各指標分別保持 None
+
+    return result
+
+
+def compute_value_score(
+    indicator_scores: dict[str, float | None],
+    user_override: float | None = None,
+) -> tuple[float, dict[str, float]]:
+    """
+    計算加權綜合估值評分 (0-100)。
+    若某指標為 None（無法取得），自動重新分配其權重至可用指標。
+
+    低分 (0-30) = 低估 → 應加槓桿
+    中分 (40-60) = 公允 → 標準槓桿
+    高分 (70-100) = 高估 → 應減槓桿
+
+    Args:
+        indicator_scores: compute_indicator_scores() 的輸出
+        user_override: 用戶手動輸入的評分（若非 None 則完全使用此值）
+
+    Returns:
+        (composite_score: float, effective_weights: dict)
+    """
+    if user_override is not None:
+        return float(user_override), {}
+
+    WEIGHTS: dict[str, float] = {
+        "pe_score":          0.25,
+        "vix_score":         0.25,
+        "dividend_score":    0.15,
+        "yield_curve_score": 0.15,
+        "pb_score":          0.10,
+        "erp_score":         0.10,
+    }
+
+    available = {k: v for k, v in indicator_scores.items() if v is not None and k in WEIGHTS}
+    if not available:
+        return 50.0, {}  # 完全無數據 → 中性
+
+    total_w = sum(WEIGHTS[k] for k in available)
+    eff_w = {k: WEIGHTS[k] / total_w for k in available}
+    composite = sum(eff_w[k] * available[k] for k in available)
+    return max(0.0, min(100.0, composite)), eff_w
+
+
+def value_multiplier_from_score(score: float, aggressiveness: float = 1.0) -> float:
+    """
+    將價值評分 (0-100) 轉換為倉位乘數（對稱版）。
+
+    設計邏輯（源自槓桿思維 + 生命投資法）：
+    - 低估區（score ≤ 40）：大跌/恐慌時 Kelly 自動降低，此乘數反向補償加槓
+    - 公允區（40 < score < 60）：無調整，乘數 = 1.0
+    - 高估區（score ≥ 60）：市場泡沫時主動減倉（對稱保護）
+
+    Aggressiveness:
+    - 0.5（保守）：±25% 最大調整
+    - 1.0（標準）：±50% 最大調整
+    - 1.5（激進）：±75% 最大調整
+
+    Args:
+        score: 價值評分 (0-100)
+        aggressiveness: 槓桿激進度 (0.5-1.5)
+
+    Returns:
+        value_multiplier: 倉位乘數（約 0.25x - 1.75x）
+    """
+    if score <= 40:
+        return 1.0 + 0.5 * ((40.0 - score) / 40.0) * aggressiveness
+    elif score < 60:
+        return 1.0
+    else:
+        # 對稱修正：高估保護力與低估加碼力相同（移除舊版 /1.5 偏斜）
+        return max(0.25, 1.0 - 0.5 * ((score - 60.0) / 40.0) * aggressiveness)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 原有分析層函數
+# ──────────────────────────────────────────────────────────────────────────
+
 def compute_log_returns(prices: pd.Series) -> pd.Series:
     """
     計算每日對數報酬率 R_t = ln(P_t / P_{t-1})。
@@ -520,6 +750,7 @@ def plot_monte_carlo(
     f: float,
     n_display: int = 200,
     seed: int = 0,
+    title_suffix: str = "",
 ) -> go.Figure:
     """
     繪製蒙地卡羅資金曲線模擬圖（高效能版本）。
@@ -620,7 +851,9 @@ def plot_monte_carlo(
     fig.update_layout(
         title=(
             f"蒙地卡羅未來一年資金曲線模擬 (1,000 路徑｜倉位 {f*100:.1f}%)<br>"
-            f"<sup>95% VaR 最大回撤：{var95_drawdown*100:.2f}%</sup>"
+            f"<sup>95% VaR 最大回撤：{var95_drawdown*100:.2f}%"
+            + (f"　{title_suffix}" if title_suffix else "")
+            + "</sup>"
         ),
         xaxis_title="交易日",
         xaxis=dict(automargin=True),
@@ -910,6 +1143,129 @@ def main() -> None:
             ),
         )
 
+        # ──────────────────────────────────────────
+        # 💎 價值評估區（市場低估/高估判斷）
+        # ──────────────────────────────────────────
+        st.markdown("---")
+        st.subheader("💎 價值評估")
+
+        _r_free_sidebar: float = r_free_pct / 100.0
+
+        # ── 自動抓取市場指標 ──
+        _indicators = fetch_market_indicators(ticker, r_free=_r_free_sidebar)
+
+        # 台股 PE 特別處理：yfinance 無法取得 ^TWII trailingPE
+        _manual_pe: float | None = None
+        if ticker == "^TWII" and _indicators.get("pe_ratio") is None:
+            with st.expander("📋 台股 P/E 手動輸入（yfinance 不支援指數 PE）"):
+                _manual_pe = st.number_input(
+                    "台股加權指數 P/E（可參考：台灣指數公司 / CMoney）",
+                    min_value=5.0, max_value=50.0, value=15.0, step=0.5,
+                    help="歷史中位約 15x；低於 12 = 低估；高於 22 = 高估",
+                )
+
+        # ── 市場估值儀表板（expander 展開） ──
+        with st.expander("📊 市場指標儀表板（自動更新，點擊展開）", expanded=False):
+            _c1, _c2 = st.columns(2)
+
+            _pe_val = _manual_pe if _manual_pe else _indicators.get("pe_ratio")
+            with _c1:
+                if _pe_val:
+                    _pe_bench = INDICATOR_BENCHMARKS["pe"].get(ticker, INDICATOR_BENCHMARKS["pe"]["VOO"])
+                    st.metric("P/E 本益比", f"{_pe_val:.1f}x",
+                              f"低估<{_pe_bench['low']}  公允~{_pe_bench['fair']}  高估>{_pe_bench['high']}",
+                              help="低 PE = 便宜 = 建議加槓桿")
+                else:
+                    st.info("P/E：無法自動取得")
+
+            _pb_val = _indicators.get("pb_ratio")
+            with _c2:
+                if _pb_val:
+                    _pb_bench = INDICATOR_BENCHMARKS["pb"].get(ticker, INDICATOR_BENCHMARKS["pb"]["VOO"])
+                    st.metric("P/B 淨值比", f"{_pb_val:.2f}x",
+                              f"低估<{_pb_bench['low']}  公允~{_pb_bench['fair']}  高估>{_pb_bench['high']}",
+                              help="低 P/B = 便宜 = 建議加槓桿")
+                else:
+                    st.info("P/B：無法自動取得")
+
+            _c3, _c4 = st.columns(2)
+
+            _div_val = _indicators.get("dividend_yield")
+            with _c3:
+                if _div_val:
+                    _div_bench = INDICATOR_BENCHMARKS["dividend_yield"].get(ticker, INDICATOR_BENCHMARKS["dividend_yield"]["VOO"])
+                    st.metric("股息殖利率", f"{_div_val*100:.2f}%",
+                              f"低估>{_div_bench['high']*100:.1f}%  公允~{_div_bench['fair']*100:.1f}%",
+                              help="高股息率 = 便宜 = 建議加槓桿")
+                else:
+                    st.info("股息率：無法自動取得")
+
+            _vix_val = _indicators.get("vix")
+            with _c4:
+                if _vix_val:
+                    _vix_label = "😱 恐慌（加槓機會）" if _vix_val > 30 else "😤 警戒" if _vix_val > 20 else "😌 平靜"
+                    st.metric("VIX 恐慌指數", f"{_vix_val:.1f}", _vix_label,
+                              help="VIX>30=市場恐慌=低估機會；VIX>40=極度恐慌=最佳加槓時機")
+                else:
+                    st.info("VIX：無法取得")
+
+            _c5, _c6 = st.columns(2)
+
+            _spread_val = _indicators.get("yield_spread_10y3m")
+            with _c5:
+                if _spread_val is not None:
+                    _curve_label = "⚠️ 倒掛（衰退警告）" if _spread_val < 0 else "✅ 正常" if _spread_val > 0.5 else "⚠️ 趨平"
+                    st.metric("殖利率曲線 10Y-3M", f"{_spread_val:.2f}%pt", _curve_label,
+                              help="倒掛（<0）= 衰退預警 = 建議減槓桿")
+                else:
+                    st.info("殖利率曲線：無法取得")
+
+            _erp_val = _indicators.get("erp_pct")
+            with _c6:
+                if _erp_val is not None:
+                    st.metric("股債溢價 ERP", f"{_erp_val:.2f}%", "歷史中位 5.5%",
+                              help="高 ERP = 股票相對債券便宜 = 建議加槓桿")
+                else:
+                    st.info("ERP：無法計算")
+
+        # ── 計算指標評分 ──
+        _ind_scores = compute_indicator_scores(_indicators, ticker, manual_pe=_manual_pe)
+        _value_score_auto, _eff_weights = compute_value_score(_ind_scores, user_override=None)
+
+        # ── 價值評分 Slider（可手動覆蓋） ──
+        _use_manual_score = st.checkbox(
+            "✏️ 手動覆蓋估值評分", value=False,
+            help="勾選後可加入主觀判斷（如總經分析、政策面、產業週期）",
+        )
+        if _use_manual_score:
+            value_score: float = float(st.slider(
+                "💡 手動估值評分（0=超低估，100=超高估）",
+                min_value=0, max_value=100, value=int(_value_score_auto), step=5,
+                help="0-30：低估（加槓）；40-60：公允；70-100：高估（減槓）",
+            ))
+            st.caption(f"自動計算評分（僅供參考）：{_value_score_auto:.0f} 分")
+        else:
+            value_score = _value_score_auto
+            _score_zone = "💚 低估區" if value_score < 40 else ("⚪ 公允區" if value_score < 60 else "🔴 高估區")
+            st.info(f"📊 綜合估值評分：**{value_score:.0f} 分**　{_score_zone}")
+
+        # ── 槓桿激進度 ──
+        _aggressiveness_label: str = st.select_slider(
+            "⚡ 槓桿激進度（加減碼幅度）",
+            options=["保守（±25%）", "標準（±50%）", "激進（±75%）"],
+            value="標準（±50%）",
+            help="保守：低估時最多加 25% 槓桿；激進：最多加 75% 槓桿（對稱適用於高估減倉）",
+        )
+        _aggressiveness_map: dict[str, float] = {
+            "保守（±25%）": 0.5,
+            "標準（±50%）": 1.0,
+            "激進（±75%）": 1.5,
+        }
+        aggressiveness_val: float = _aggressiveness_map[_aggressiveness_label]
+
+        # ── 計算最終價值乘數 ──
+        value_mult: float = value_multiplier_from_score(value_score, aggressiveness_val)
+
         st.divider()
         st.info(
             "⚠️ 本工具僅供量化研究參考，不構成任何投資建議。\n\n"
@@ -986,8 +1342,14 @@ def main() -> None:
     full_kelly: float = compute_kelly_analytical(
         mu_arith, sigma, r_free, r_margin, max_leverage
     )
-    fractional_kelly: float = full_kelly * kelly_multiplier
     kelly_was_capped: bool = raw_kelly_uncapped > max_leverage
+
+    # 價值調整後 Kelly
+    kelly_value_adjusted: float = full_kelly * value_mult
+    kelly_value_adjusted_capped: float = float(np.clip(kelly_value_adjusted, -1.0, max_leverage))
+    value_was_capped: bool = kelly_value_adjusted > max_leverage
+
+    fractional_kelly: float = kelly_value_adjusted_capped * kelly_multiplier
 
     # ------------------------------------------------------------------
     # Top-Level Metrics
@@ -1009,7 +1371,7 @@ def main() -> None:
         help=f"模型：{sigma_model}",
     )
     col3.metric(
-        label="Full-Kelly 建議倉位",
+        label="【純 Kelly】倉位",
         value=f"{full_kelly * 100:.1f}%",
         delta=(
             f"⚠️ 已截斷（理論值 {raw_kelly_uncapped*100:.0f}%）"
@@ -1020,10 +1382,34 @@ def main() -> None:
         help=f"最大化幾何增長率的最佳倉位（理論值 = {raw_kelly_uncapped*100:.1f}%）",
     )
     col4.metric(
-        label=f"Fractional Kelly (×{kelly_multiplier:.2f})",
-        value=f"{fractional_kelly * 100:.1f}%",
-        help="Full-Kelly 乘以凱利乘數後的實際建議倉位",
+        label="【價值調整】倉位",
+        value=f"{kelly_value_adjusted_capped * 100:.1f}%",
+        delta=f"調整倍數 {value_mult:.2f}x（評分 {value_score:.0f}）",
+        delta_color="normal" if value_mult >= 1.0 else "inverse",
+        help=f"Pure Kelly × 價值乘數 {value_mult:.2f}，再截斷至 max_leverage {max_leverage:.1f}×",
     )
+
+    # 價值評估警告區
+    if value_score < 30:
+        st.success(
+            f"💚 **市場低估**（評分 {value_score:.0f}）— "
+            f"建議增加槓桿至 **{kelly_value_adjusted_capped*100:.1f}%**"
+            + (f"（+{(value_mult-1)*100:.1f}% vs 純 Kelly）" if value_mult > 1.0 else "")
+        )
+    elif value_score > 70:
+        st.warning(
+            f"🔴 **市場高估**（評分 {value_score:.0f}）— "
+            f"建議減少槓桿至 **{kelly_value_adjusted_capped*100:.1f}%**"
+            + (f"（{(value_mult-1)*100:.1f}% vs 純 Kelly）" if value_mult < 1.0 else "")
+        )
+    else:
+        st.info(f"⚪ **公允區間**（評分 {value_score:.0f}）— 倉位未調整（乘數 {value_mult:.2f}×）")
+
+    if value_was_capped:
+        st.info(
+            f"✅ 價值調整後倉位 **{kelly_value_adjusted*100:.1f}%** 超過上限，"
+            f"已安全截斷至 **{max_leverage:.1f}×（{max_leverage*100:.0f}%）**"
+        )
 
     if kelly_was_capped:
         st.warning(
@@ -1101,7 +1487,8 @@ def main() -> None:
     max_drawdowns: np.ndarray = compute_max_drawdown_per_path(mc_paths)
     var95_drawdown: float = float(np.percentile(max_drawdowns, 95))
 
-    fig_mc = plot_monte_carlo(mc_paths, var95_drawdown, sim_f)
+    _mc_title_suffix = f"價值乘數 {value_mult:.2f}×｜評分 {value_score:.0f}"
+    fig_mc = plot_monte_carlo(mc_paths, var95_drawdown, sim_f, title_suffix=_mc_title_suffix)
     st.plotly_chart(fig_mc, use_container_width=True)
 
     final_values = mc_paths[:, -1]
