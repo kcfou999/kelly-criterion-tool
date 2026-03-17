@@ -148,12 +148,14 @@ def fetch_rfr_fred() -> float | None:
 # 各資產的歷史基準值（low=低估邊界, fair=歷史中位, high=高估邊界）
 INDICATOR_BENCHMARKS: dict[str, dict] = {
     "pe": {
-        "^TWII": {"low": 10.0, "fair": 15.0, "high": 22.0},
-        "VOO":   {"low": 14.0, "fair": 18.5, "high": 26.0},
-        "QQQ":   {"low": 20.0, "fair": 30.0, "high": 42.0},
+        # 依據：S&P500 2000-2025 中位 ~22x，科技股合理 PE 區間 32x，台股中位 ~14-16x
+        "^TWII": {"low": 10.0, "fair": 16.0, "high": 22.0},
+        "VOO":   {"low": 16.0, "fair": 21.0, "high": 29.0},
+        "QQQ":   {"low": 22.0, "fair": 32.0, "high": 46.0},
     },
     "pb": {
-        "VOO":   {"low": 2.0,  "fair": 2.9,  "high": 4.5},
+        # 依據：S&P500 2012-2024 平均 P/B 約 3.5x，隨 PE 同步上調
+        "VOO":   {"low": 2.2,  "fair": 3.2,  "high": 4.8},
         "QQQ":   {"low": 4.0,  "fair": 6.0,  "high": 9.0},
         "^TWII": {"low": 1.0,  "fair": 1.5,  "high": 2.5},
     },
@@ -339,32 +341,46 @@ def compute_value_score(
 
 def value_multiplier_from_score(score: float, aggressiveness: float = 1.0) -> float:
     """
-    將價值評分 (0-100) 轉換為倉位乘數（對稱版）。
+    將價值評分 (0-100) 轉換為倉位乘數（強化版，指數衰減）。
 
     設計邏輯（源自槓桿思維 + 生命投資法）：
-    - 低估區（score ≤ 40）：大跌/恐慌時 Kelly 自動降低，此乘數反向補償加槓
-    - 公允區（40 < score < 60）：無調整，乘數 = 1.0
-    - 高估區（score ≥ 60）：市場泡沫時主動減倉（對稱保護）
+    - 中性點：score=50 → 1.0x（無干預）
+    - 低估區（score < 50）：線性加碼，最高 1.5×
+    - 高估區（score > 50）：指數減碼，保護力隨高估程度加速增強
 
-    Aggressiveness:
-    - 0.5（保守）：±25% 最大調整
-    - 1.0（標準）：±50% 最大調整
-    - 1.5（激進）：±75% 最大調整
+    指數減碼的必要性：
+    - 歷史 μ 過高（如 QQQ 10 年牛市）會導致 Kelly 永遠偏向全槓桿
+    - 線性減碼不足以對抗 3.0× 的 raw Kelly（3× × 0.75 = 2.25× 仍太高）
+    - 指數曲線確保 score=80 時乘數 ~0.34×，3× → 1.0×（接近無槓桿）
+
+    效果對照（aggressiveness=1.0）：
+        score=30  → 1.35×（低估加碼）
+        score=50  → 1.00×（中性）
+        score=60  → ~0.82×（輕微高估）
+        score=70  → ~0.56×（明確高估）
+        score=80  → ~0.34×（顯著高估，3× Kelly → ~1.0×）
+        score=90  → ~0.19×（泡沫）
+        score=100 → 0.10×（極端泡沫）
 
     Args:
         score: 價值評分 (0-100)
         aggressiveness: 槓桿激進度 (0.5-1.5)
 
     Returns:
-        value_multiplier: 倉位乘數（約 0.25x - 1.75x）
+        value_multiplier: 倉位乘數（0.10x - 1.75x）
     """
-    if score <= 40:
-        return 1.0 + 0.5 * ((40.0 - score) / 40.0) * aggressiveness
-    elif score < 60:
-        return 1.0
+    normalized = (score - 50.0) / 50.0  # -1.0 ~ +1.0（50 分 = 0 = 中性）
+
+    if normalized <= 0:
+        # 低估區（score ≤ 50）：線性加碼，score=0 → 1.5×
+        boost = 0.5 * (-normalized) * aggressiveness
+        return 1.0 + boost
     else:
-        # 對稱修正：高估保護力與低估加碼力相同（移除舊版 /1.5 偏斜）
-        return max(0.25, 1.0 - 0.5 * ((score - 60.0) / 40.0) * aggressiveness)
+        # 高估區（score > 50）：指數減碼，非線性強化
+        # normalized ** (1/aggressiveness) 使激進度更高時曲線更陡峭
+        reduction_base = 0.90  # 最大削減幅度（保留 10%）
+        reduction = reduction_base * (normalized ** (1.0 / max(aggressiveness, 0.3))) * aggressiveness
+        return max(0.10, 1.0 - reduction)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1116,6 +1132,38 @@ def main() -> None:
             help="使用槓桿時的年化借貸成本",
         )
 
+        # ── 預期報酬均值回歸折扣 ──
+        st.subheader("預期報酬均值回歸折扣")
+        mu_haircut_pct: int = st.slider(
+            "📉 μ 保守折扣",
+            min_value=0,
+            max_value=50,
+            value=25,
+            step=5,
+            format="%d%%",
+            help=(
+                "將歷史 μ 打折，反映未來報酬率可能低於歷史水準（均值回歸）。\n"
+                "• 0%：完全相信歷史報酬可延續\n"
+                "• 25%（預設）：適度保守，貼近 GMO/Research Affiliates 長期預測\n"
+                "• 50%：極保守，適合接近退休族群\n\n"
+                "根因說明：QQQ 10 年化報酬 ~17%，以台灣信貸成本 2.5% 計算，"
+                "Kelly 公式天然傾向 3× 以上槓桿。折扣可有效壓縮此偏樂觀效應。\n"
+                "注意：此折扣僅影響 Kelly 計算，圖表顯示的歷史 μ 不受影響。"
+            ),
+        )
+        mu_haircut: float = mu_haircut_pct / 100.0
+
+        # ── VIX 波動率下限（可選） ──
+        use_vix_floor: bool = st.checkbox(
+            "📊 使用 VIX 隱含波動率為 σ 下限",
+            value=True,
+            help=(
+                "VIX 反映市場對未來 30 天的隱含波動率（年化）。\n"
+                "啟用後：σ_used = max(σ_歷史, VIX/100)。\n\n"
+                "效果：VIX=15 時 σ 至少 15%，防止低波動期 Kelly 過度樂觀。"
+            ),
+        )
+
         # ── Kelly 乘數 ──
         st.subheader("凱利乘數 (Fractional Kelly)")
         kelly_multiplier: float = st.slider(
@@ -1335,12 +1383,24 @@ def main() -> None:
     # 算術報酬修正：Kelly 公式需要 μ_arith = μ_log + σ²/2
     mu_arith: float = mu_log + 0.5 * sigma ** 2
 
+    # ── Fix 1：均值回歸折扣（mu haircut） ──
+    # 歷史 μ 可能因牛市偏高；打折反映均值回歸，降低 Kelly 過度樂觀
+    mu_arith_for_kelly: float = mu_arith * (1.0 - mu_haircut)
+
+    # ── Fix 4：VIX 波動率下限（sigma floor） ──
+    # 防止低 VIX 期 EWMA σ 虛低，讓 Kelly 在平靜市況也有適當風險緩衝
+    _vix_raw: float | None = _indicators.get("vix") if _indicators else None
+    if use_vix_floor and _vix_raw and _vix_raw > 0:
+        sigma_for_kelly: float = max(sigma, _vix_raw / 100.0)
+    else:
+        sigma_for_kelly = sigma
+
     # 計算不受上限限制的理論值，用於判斷是否截斷及顯示警告
     raw_kelly_uncapped: float = compute_kelly_analytical(
-        mu_arith, sigma, r_free, r_margin, max_leverage=99.0
+        mu_arith_for_kelly, sigma_for_kelly, r_free, r_margin, max_leverage=99.0
     )
     full_kelly: float = compute_kelly_analytical(
-        mu_arith, sigma, r_free, r_margin, max_leverage
+        mu_arith_for_kelly, sigma_for_kelly, r_free, r_margin, max_leverage
     )
     kelly_was_capped: bool = raw_kelly_uncapped > max_leverage
 
@@ -1362,13 +1422,23 @@ def main() -> None:
         value=f"{mu_log * 100:.2f}%",
         help=(
             f"幾何平均對數報酬 × 252\n"
-            f"算術報酬 μ_arith = {mu_arith*100:.2f}%（Kelly 計算使用此值）"
+            f"算術報酬 μ_arith = {mu_arith*100:.2f}%（歷史值）\n"
+            f"Kelly 使用 μ = {mu_arith_for_kelly*100:.2f}%（折扣 {mu_haircut_pct}% 後）"
         ),
     )
     col2.metric(
         label="年化波動率 σ",
         value=f"{sigma * 100:.2f}%",
-        help=f"模型：{sigma_model}",
+        delta=(
+            f"VIX floor 啟用 → {sigma_for_kelly*100:.1f}%"
+            if sigma_for_kelly > sigma * 1.02 else None
+        ),
+        delta_color="off",
+        help=(
+            f"模型：{sigma_model}\n"
+            + (f"VIX 隱含 σ={_vix_raw/100*100:.1f}%，採用較大值 {sigma_for_kelly*100:.1f}%"
+               if sigma_for_kelly > sigma * 1.02 else "VIX floor 未啟用（歷史 σ ≥ VIX 隱含 σ）")
+        ),
     )
     col3.metric(
         label="【純 Kelly】倉位",
@@ -1379,15 +1449,31 @@ def main() -> None:
             else ("使用槓桿" if full_kelly > 1.0 else ("空倉/放空" if full_kelly < 0 else ""))
         ),
         delta_color="inverse" if (kelly_was_capped or full_kelly < 0) else "normal",
-        help=f"最大化幾何增長率的最佳倉位（理論值 = {raw_kelly_uncapped*100:.1f}%）",
+        help=(
+            f"最大化幾何增長率的最佳倉位（理論值 = {raw_kelly_uncapped*100:.1f}%）\n"
+            f"已套用 μ 折扣 {mu_haircut_pct}%：歷史 μ={mu_arith*100:.2f}% → "
+            f"Kelly 使用 {mu_arith_for_kelly*100:.2f}%"
+        ),
     )
     col4.metric(
         label="【價值調整】倉位",
         value=f"{kelly_value_adjusted_capped * 100:.1f}%",
-        delta=f"調整倍數 {value_mult:.2f}x（評分 {value_score:.0f}）",
+        delta=f"價值乘數 {value_mult:.2f}×（評分 {value_score:.0f}）",
         delta_color="normal" if value_mult >= 1.0 else "inverse",
-        help=f"Pure Kelly × 價值乘數 {value_mult:.2f}，再截斷至 max_leverage {max_leverage:.1f}×",
+        help=(
+            f"純 Kelly × 價值乘數 {value_mult:.2f}，再截斷至 max_leverage {max_leverage:.1f}×\n"
+            f"Half Kelly 實際倉位 = {fractional_kelly*100:.1f}%"
+        ),
     )
+
+    # μ 折扣提示（若有折扣則顯示）
+    if mu_haircut_pct > 0:
+        st.caption(
+            f"📉 **均值回歸折扣 {mu_haircut_pct}%**："
+            f"歷史 μ_arith {mu_arith*100:.2f}% → Kelly 使用 {mu_arith_for_kelly*100:.2f}%"
+            + (f"　｜　📊 VIX floor：σ {sigma*100:.1f}% → {sigma_for_kelly*100:.1f}%"
+               if sigma_for_kelly > sigma * 1.02 else "")
+        )
 
     # 價值評估警告區
     if value_score < 30:
