@@ -1,0 +1,7 @@
+streamlit>=1.35.0
+yfinance>=0.2.40
+pandas>=2.0.0
+numpy>=1.25.0
+scipy>=1.11.0
+plotly>=5.20.0
+pandas-datareader>=0.10.0

@@ -1,0 +1,17 @@
+[server]
+# 雲端部署必要設定（Streamlit Community Cloud / Railway 等）
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+# 停用匿名使用統計，移除啟動時的 email 詢問訊息
+gatherUsageStats = false
+
+[theme]
+# 深色主題，與圖表 plotly_dark 一致，避免 UI 白底與深色圖表違和
+base = "dark"
+primaryColor = "#4A90D9"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#1E2130"
+textColor = "#FAFAFA"

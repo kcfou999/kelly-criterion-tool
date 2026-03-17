@@ -1,0 +1,14 @@
+# pip 指令輸入錯誤產生的殘留檔
+=0.10.0
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# 環境變數
+.env
+.env.*
+
+# 本機 Streamlit 快取
+.streamlit/secrets.toml
