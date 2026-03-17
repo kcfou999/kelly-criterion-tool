@@ -23,7 +23,7 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
-import pandas_datareader.data as pdr
+# import pandas_datareader.data as pdr  # 暫時禁用以規避 Streamlit Cloud 相容性問題
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
@@ -106,6 +106,9 @@ def fetch_data_stooq(
     """
     從 Stooq 下載收盤價作為交叉驗證資料來源（無需 API Key）。
 
+    【已禁用】pandas_datareader 在 Streamlit Cloud 上的相容性問題，改為返回 None。
+    使用 yfinance 作為唯一數據源。
+
     Args:
         ticker_stooq: Stooq 格式的股票代號，如 "VOO.US"、"^twii"。
         start: 開始日期。
@@ -114,14 +117,8 @@ def fetch_data_stooq(
     Returns:
         以日期為 index 的收盤價 pd.Series；若失敗則回傳 None（靜默降級）。
     """
-    try:
-        df = pdr.get_data_stooq(ticker_stooq, start=start, end=end)
-        if df is None or df.empty or "Close" not in df.columns:
-            return None
-        close = df["Close"].sort_index().dropna()  # Stooq 預設降序，需排序
-        return close if len(close) >= 2 else None
-    except Exception:
-        return None
+    # pandas_datareader 已禁用以規避 Streamlit Cloud 相容性問題
+    return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -129,19 +126,14 @@ def fetch_rfr_fred() -> float | None:
     """
     從 FRED 取得最新 3 個月美國國庫券殖利率 (DGS3MO) 作為無風險利率參考。
 
+    【已禁用】pandas_datareader 在 Streamlit Cloud 上的相容性問題，改為返回 None。
+    使用預設的 4.0% 無風險利率。
+
     Returns:
         年化無風險利率（小數形式，例如 0.043 代表 4.3%）；失敗則回傳 None。
     """
-    try:
-        end_dt = date.today()
-        start_dt = end_dt - timedelta(days=30)
-        df = pdr.get_data_fred("DGS3MO", start=start_dt, end=end_dt)
-        df = df.dropna()
-        if df.empty:
-            return None
-        return float(df.iloc[-1, 0] / 100.0)
-    except Exception:
-        return None
+    # pandas_datareader 已禁用以規避 Streamlit Cloud 相容性問題
+    return None
 
 
 # ---------------------------------------------------------------------------
